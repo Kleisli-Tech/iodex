@@ -39,7 +39,7 @@ impl<T: HttpTransport, A: AuthProvider> CompactClient<T, A> {
     fn path(&self) -> Result<&'static str, ApiError> {
         match self.provider.wire {
             WireApi::Compact | WireApi::Responses => Ok("responses/compact"),
-            WireApi::Chat => Err(ApiError::Stream(
+            WireApi::Chat | WireApi::AnthropicMessages => Err(ApiError::Stream(
                 "compact endpoint requires responses wire api".to_string(),
             )),
         }

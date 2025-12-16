@@ -361,6 +361,14 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
             truncation_policy: TruncationPolicy::Bytes(10_000),
             context_window: Some(CONTEXT_WINDOW_272K),
         )
+    } else if slug.starts_with("claude") {
+        model_family!(
+            slug, "claude",
+            shell_type: ConfigShellToolType::ShellCommand,
+            supports_parallel_tool_calls: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Function),
+            context_window: Some(200_000),
+        )
     } else {
         derive_default_model_family(slug)
     }
@@ -539,5 +547,17 @@ mod tests {
             vec!["alpha".to_string(), "beta".to_string()]
         );
         assert_eq!(updated.base_instructions, "Remote instructions");
+    }
+
+    #[test]
+    fn claude_family_uses_shell_command_and_parallel_tools() {
+        let family = find_family_for_model("claude-sonnet-4.5");
+        assert_eq!(family.shell_type, ConfigShellToolType::ShellCommand);
+        assert_eq!(
+            family.apply_patch_tool_type,
+            Some(ApplyPatchToolType::Function)
+        );
+        assert!(family.supports_parallel_tool_calls);
+        assert_eq!(family.context_window, Some(200_000));
     }
 }

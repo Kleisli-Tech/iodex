@@ -788,6 +788,33 @@ pub fn create_tools_json_for_responses_api(
 
     Ok(tools_json)
 }
+
+/// Returns JSON values compatible with Anthropic Messages tools:
+/// https://docs.claude.ai/api/messages
+pub fn create_tools_json_for_anthropic_messages(
+    tools: &[ToolSpec],
+) -> crate::error::Result<Vec<serde_json::Value>> {
+    let mut tools_json = Vec::new();
+
+    for tool in tools {
+        if let ToolSpec::Function(ResponsesApiTool {
+            name,
+            description,
+            parameters,
+            ..
+        }) = tool
+        {
+            let input_schema = serde_json::to_value(parameters)?;
+            tools_json.push(json!({
+                "name": name,
+                "description": description,
+                "input_schema": input_schema,
+            }));
+        }
+    }
+
+    Ok(tools_json)
+}
 /// Returns JSON values that are compatible with Function Calling in the
 /// Chat Completions API:
 /// https://platform.openai.com/docs/guides/function-calling?api-mode=chat
@@ -2154,6 +2181,41 @@ Examples of valid command strings:
                             "foo": { "type": "string" }
                         },
                     },
+                }
+            })]
+        );
+    }
+
+    #[test]
+    fn anthropic_tools_use_input_schema() {
+        let mut properties = BTreeMap::new();
+        properties.insert("foo".to_string(), JsonSchema::String { description: None });
+        let tools = vec![
+            ToolSpec::Function(ResponsesApiTool {
+                name: "demo".to_string(),
+                description: "A demo tool".to_string(),
+                strict: false,
+                parameters: JsonSchema::Object {
+                    properties,
+                    required: None,
+                    additional_properties: None,
+                },
+            }),
+            ToolSpec::LocalShell {},
+        ];
+
+        let tools_json = create_tools_json_for_anthropic_messages(&tools).unwrap();
+
+        assert_eq!(
+            tools_json,
+            vec![json!({
+                "name": "demo",
+                "description": "A demo tool",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "foo": { "type": "string" }
+                    }
                 }
             })]
         );

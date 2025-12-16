@@ -250,12 +250,240 @@ impl Stream for ResponseStream {
     }
 }
 
+pub(crate) mod anthropic {
+    use super::Prompt;
+    use super::Result;
+    use crate::openai_models::model_family::ModelFamily;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
+    use serde_json::Value;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    pub(crate) fn build_anthropic_messages_body(
+        prompt: &Prompt,
+        model_family: &ModelFamily,
+        instructions: String,
+        tools_json: Vec<Value>,
+    ) -> Result<Value> {
+        let model = model_family.get_model_slug().to_string();
+        let system = instructions;
+        let messages = response_items_to_anthropic_messages(prompt);
+
+        let tool_choice = if !tools_json.is_empty() && model_family.supports_parallel_tool_calls {
+            Some(json!({ "type": "auto" }))
+        } else {
+            None
+        };
+
+        let max_tokens = compute_max_tokens(model_family);
+
+        let mut body = json!({
+            "model": model,
+            "system": system,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+
+        if !tools_json.is_empty() {
+            body.as_object_mut()
+                .expect("anthropic body is object")
+                .insert("tools".to_string(), Value::Array(tools_json));
+        }
+
+        if let Some(choice) = tool_choice {
+            body.as_object_mut()
+                .expect("anthropic body is object")
+                .insert("tool_choice".to_string(), choice);
+        }
+
+        Ok(body)
+    }
+
+    fn compute_max_tokens(model_family: &ModelFamily) -> i64 {
+        let context_window = model_family.context_window.unwrap_or(200_000);
+        let effective_limit = model_family
+            .auto_compact_token_limit()
+            .unwrap_or(context_window);
+        let fraction = effective_limit.saturating_mul(25).saturating_div(100);
+        let hard_cap = 64_000;
+        let capped = fraction.min(hard_cap);
+        capped.max(1)
+    }
+
+    fn response_items_to_anthropic_messages(prompt: &Prompt) -> Vec<Value> {
+        let input = prompt.get_formatted_input();
+        let mut messages: Vec<Value> = Vec::new();
+
+        // Build a lookup from call_id -> first FunctionCallOutput index so we can
+        // emit tool_use and tool_result as adjacent messages, as required by
+        // the Anthropic Messages tools protocol.
+        let mut first_output_index_by_call_id: HashMap<&str, usize> = HashMap::new();
+        for (idx, item) in input.iter().enumerate() {
+            if let ResponseItem::FunctionCallOutput { call_id, .. } = item {
+                first_output_index_by_call_id
+                    .entry(call_id.as_str())
+                    .or_insert(idx);
+            }
+        }
+        let mut consumed_output_indices: HashSet<usize> = HashSet::new();
+
+        let mut index = 0;
+        while index < input.len() {
+            match &input[index] {
+                ResponseItem::Message { role, content, .. } => {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    for c in content {
+                        match c {
+                            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                                if !text.trim().is_empty() {
+                                    blocks.push(json!({ "type": "text", "text": text }));
+                                }
+                            }
+                            ContentItem::InputImage { image_url } => {
+                                blocks.push(json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": image_url },
+                                }));
+                            }
+                        }
+                    }
+                    if !blocks.is_empty() {
+                        messages.push(json!({
+                            "role": role,
+                            "content": blocks,
+                        }));
+                    }
+                }
+                ResponseItem::FunctionCall {
+                    name,
+                    arguments,
+                    call_id,
+                    ..
+                } => {
+                    let input_json: Value =
+                        serde_json::from_str(&arguments).unwrap_or_else(|_| json!(arguments));
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": input_json,
+                        }],
+                    }));
+
+                    // If we have a corresponding FunctionCallOutput later in the
+                    // history, emit its tool_result immediately after this tool_use
+                    // so that Anthropic sees the required adjacency.
+                    if let Some(output_index) =
+                        first_output_index_by_call_id.get(call_id.as_str()).copied()
+                    {
+                        if output_index > index
+                            && !consumed_output_indices.contains(&output_index)
+                            && matches!(
+                                input.get(output_index),
+                                Some(ResponseItem::FunctionCallOutput { .. })
+                            )
+                        {
+                            if let Some(ResponseItem::FunctionCallOutput { output, .. }) =
+                                input.get(output_index)
+                            {
+                                let content_value = function_output_to_tool_result_content(output);
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": [{
+                                        "type": "tool_result",
+                                        "tool_use_id": call_id,
+                                        "content": content_value,
+                                    }],
+                                }));
+                                consumed_output_indices.insert(output_index);
+                            }
+                        }
+                    }
+                }
+                ResponseItem::FunctionCallOutput { call_id, output } => {
+                    // If this output was not already paired with its call above
+                    // (for example, if the call is missing or out of order), emit
+                    // a standalone tool_result message to preserve the transcript.
+                    if !consumed_output_indices.contains(&index) {
+                        let content_value = function_output_to_tool_result_content(output);
+                        messages.push(json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": content_value,
+                            }],
+                        }));
+                    }
+                }
+                ResponseItem::Reasoning { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::CustomToolCall { .. }
+                | ResponseItem::CustomToolCallOutput { .. }
+                | ResponseItem::WebSearchCall { .. }
+                | ResponseItem::GhostSnapshot { .. }
+                | ResponseItem::Compaction { .. }
+                | ResponseItem::Other => {}
+            }
+            index += 1;
+        }
+
+        messages
+    }
+
+    fn function_output_to_tool_result_content(output: &FunctionCallOutputPayload) -> Value {
+        if let Some(items) = &output.content_items {
+            let mapped: Vec<Value> = items
+                .iter()
+                .filter_map(|it| match it {
+                    FunctionCallOutputContentItem::InputText { text } => {
+                        if text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(json!({ "type": "text", "text": text }))
+                        }
+                    }
+                    FunctionCallOutputContentItem::InputImage { image_url } => Some(json!({
+                        "type": "image_url",
+                        "image_url": { "url": image_url },
+                    })),
+                })
+                .collect();
+            if mapped.is_empty() && !output.content.trim().is_empty() {
+                Value::Array(vec![json!({
+                    "type": "text",
+                    "text": output.content,
+                })])
+            } else {
+                Value::Array(mapped)
+            }
+        } else {
+            if output.content.trim().is_empty() {
+                Value::Array(vec![])
+            } else {
+                Value::Array(vec![json!({
+                    "type": "text",
+                    "text": output.content,
+                })])
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use codex_api::ResponsesApiRequest;
     use codex_api::common::OpenAiVerbosity;
     use codex_api::common::TextControls;
     use codex_api::create_text_param_for_request;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
 
     use crate::config::test_config;
@@ -427,5 +655,292 @@ mod tests {
 
         let v = serde_json::to_value(&req).expect("json");
         assert!(v.get("text").is_none());
+    }
+
+    #[test]
+    fn anthropic_body_includes_basic_fields() {
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "Hello, Claude".to_string(),
+            }],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+        let body = crate::client_common::anthropic::build_anthropic_messages_body(
+            &prompt,
+            &model_family,
+            instructions.clone(),
+            tools_json,
+        )
+        .expect("anthropic body");
+
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("claude-sonnet-4.5")
+        );
+        assert_eq!(
+            body.get("system").and_then(|v| v.as_str()),
+            Some(instructions.as_str())
+        );
+        assert_eq!(body.get("stream").and_then(|v| v.as_bool()), Some(true));
+
+        let max_tokens = body.get("max_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        assert!(max_tokens > 0);
+        assert!(max_tokens <= 64_000);
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        let first = messages.first().cloned().unwrap();
+        assert_eq!(first.get("role").and_then(|v| v.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn anthropic_tool_use_and_result_are_adjacent() {
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "Run a tool and continue".to_string(),
+            }],
+        });
+
+        let call_id = "toolu_01ABC";
+        prompt.input.push(ResponseItem::FunctionCall {
+            id: None,
+            name: "update_plan".to_string(),
+            arguments: r#"{"step":"one"}"#.to_string(),
+            call_id: call_id.to_string(),
+        });
+
+        // In realistic history, assistant text may be recorded between the call and
+        // its output; the Anthropic mapping must still emit tool_result immediately
+        // after the corresponding tool_use.
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![codex_protocol::models::ContentItem::OutputText {
+                text: "Running the plan tool...".to_string(),
+            }],
+        });
+
+        prompt.input.push(ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload {
+                content: "ok".to_string(),
+                content_items: None,
+                success: Some(true),
+            },
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+        let body = crate::client_common::anthropic::build_anthropic_messages_body(
+            &prompt,
+            &model_family,
+            instructions,
+            tools_json,
+        )
+        .expect("anthropic body");
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(
+            messages.len() >= 3,
+            "expected at least user, tool_use, tool_result messages"
+        );
+
+        // messages[0] should be the initial user message.
+        assert_eq!(
+            messages[0].get("role").and_then(|v| v.as_str()),
+            Some("user")
+        );
+
+        // messages[1] should contain the tool_use block.
+        let second = &messages[1];
+        assert_eq!(
+            second.get("role").and_then(|v| v.as_str()),
+            Some("assistant")
+        );
+        let second_blocks = second
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            second_blocks.iter().any(|block| {
+                block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                    && block.get("id").and_then(|v| v.as_str()) == Some(call_id)
+            }),
+            "expected tool_use block with the call id in second message"
+        );
+
+        // messages[2] must immediately contain the corresponding tool_result block.
+        let third = &messages[2];
+        assert_eq!(third.get("role").and_then(|v| v.as_str()), Some("user"));
+        let third_blocks = third
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            third_blocks.iter().any(|block| {
+                block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    && block.get("tool_use_id").and_then(|v| v.as_str()) == Some(call_id)
+            }),
+            "expected tool_result block referencing the same call id in third message"
+        );
+    }
+
+    #[test]
+    fn anthropic_omits_whitespace_only_message_text_blocks() {
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                codex_protocol::models::ContentItem::InputText {
+                    text: "   ".to_string(),
+                },
+                codex_protocol::models::ContentItem::InputText {
+                    text: "kept".to_string(),
+                },
+            ],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+        let body = crate::client_common::anthropic::build_anthropic_messages_body(
+            &prompt,
+            &model_family,
+            instructions,
+            tools_json,
+        )
+        .expect("anthropic body");
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+
+        let content_blocks = messages[0]
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let texts: Vec<String> = content_blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(ToString::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(texts, vec!["kept".to_string()]);
+    }
+
+    #[test]
+    fn anthropic_tool_result_does_not_emit_whitespace_only_text_blocks() {
+        let mut prompt = Prompt::default();
+        let call_id = "tool_01EMPTY";
+        prompt.input.push(ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload {
+                content: "   ".to_string(),
+                content_items: None,
+                success: Some(true),
+            },
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+        let body = crate::client_common::anthropic::build_anthropic_messages_body(
+            &prompt,
+            &model_family,
+            instructions,
+            tools_json,
+        )
+        .expect("anthropic body");
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+
+        let content_blocks = messages[0]
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(content_blocks.len(), 1);
+
+        let tool_result = &content_blocks[0];
+        assert_eq!(
+            tool_result.get("type").and_then(|t| t.as_str()),
+            Some("tool_result")
+        );
+
+        let tool_result_content = tool_result
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let texts: Vec<String> = tool_result_content
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(ToString::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            texts.iter().all(|t| !t.trim().is_empty()),
+            "expected no whitespace-only text blocks in tool_result content"
+        );
     }
 }

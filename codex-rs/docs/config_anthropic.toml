@@ -1,0 +1,19 @@
+[model_providers.azure_claude]
+name = "Claude on Azure"
+# Base URL for Anthropic Messages on Azure AI Foundry.
+# Replace <resource-name> with your Azure AI Foundry resource name.
+base_url = "https://<resource-name>.services.ai.azure.com/anthropic/v1"
+# Anthropic Messages wire API.
+wire_api = "anthropic-messages"
+# Anthropic API version header; update if Azure/Anthropic docs require a newer version.
+http_headers = { anthropic-version = "2023-06-01" }
+# API key header sourced from an environment variable.
+env_http_headers = { "x-api-key" = "AZURE_API_KEY" }
+
+# When using this provider, set:
+#   model_provider = "azure_claude"
+#   model = "<deployment-name>"
+#
+# The model value must be the deployment name you configured in Azure AI Foundry,
+# which may differ from the underlying catalog model id (for example,
+# `claude-sonnet-4-5`).

@@ -12,6 +12,8 @@ pub enum WireApi {
     Responses,
     Chat,
     Compact,
+    /// Anthropic Messages API (`/v1/messages`).
+    AnthropicMessages,
 }
 
 /// High-level retry configuration for a provider.

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use codex_api::AggregateStreamExt;
+use codex_api::AnthropicMessagesClient as ApiAnthropicMessagesClient;
 use codex_api::ChatClient as ApiChatClient;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
@@ -107,14 +108,14 @@ impl ModelClient {
         &self.provider
     }
 
-    /// Streams a single model turn using either the Responses or Chat
-    /// Completions wire API, depending on the configured provider.
+    /// Streams a single model turn using the configured wire API.
     ///
     /// For Chat providers, the underlying stream is optionally aggregated
     /// based on the `show_raw_agent_reasoning` flag in the config.
     pub async fn stream(&self, prompt: &Prompt) -> Result<ResponseStream> {
         match self.provider.wire_api {
             WireApi::Responses => self.stream_responses_api(prompt).await,
+            WireApi::AnthropicMessages => self.stream_anthropic_messages_api(prompt).await,
             WireApi::Chat => {
                 let api_stream = self.stream_chat_completions(prompt).await?;
 
@@ -175,6 +176,71 @@ impl ModelClient {
 
             match stream_result {
                 Ok(stream) => return Ok(stream),
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::UNAUTHORIZED =>
+                {
+                    handle_unauthorized(status, &mut refreshed, &auth_manager, &auth).await?;
+                    continue;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
+    /// Streams a turn via the Anthropic Messages API.
+    async fn stream_anthropic_messages_api(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        let auth_manager = self.auth_manager.clone();
+        let model_family = self.get_model_family();
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json =
+            crate::tools::spec::create_tools_json_for_anthropic_messages(&prompt.tools)?;
+
+        // NOTE: `conversation_id` and `session_source` in the Anthropic path would be useful
+        // when we start doing something analogous to what the Responses/Chat paths already do:
+        // - Prompt caching / continuation semantics
+        //     For OpenAI Responses, we set prompt_cache_key to the conversation_id so the
+        //     backend can cache and reuse context. If Anthropic gains an equivalent (e.g., cache
+        //     key or thread id), you’d reuse conversation_id for that.
+        // - Sub‑agent / source labeling
+        //     Today, Responses/Chat attach session_source via x-openai-subagent to say “this turn
+        //     is coming from the Review agent”, etc. If you introduce Anthropic‑specific headers
+        //     or metadata for sub‑agents, you’d pass session_source down to:
+        //     - Label Anthropic calls by agent (review, exec, MCP, etc.).
+        //     - Drive per‑agent behavior or routing on the Anthropic side, if supported.
+        // - Cross‑provider telemetry and debugging
+        //     Even without a server‑side field, you might propagate conversation_id and session_source into:
+        //     - Internal logs / tracing attached to Anthropic requests.
+        //     - Metrics keyed by conversation or agent type, so Anthropic and Responses traffic can be analyzed on the
+        //         same axes.
+        let _conversation_id = self.conversation_id.to_string();
+        let _session_source = self.session_source.clone();
+
+        // Build the Anthropic request body from the neutral Prompt/ResponseItem history.
+        let body = crate::client_common::anthropic::build_anthropic_messages_body(
+            prompt,
+            &model_family,
+            instructions,
+            tools_json,
+        )?;
+
+        let mut refreshed = false;
+        loop {
+            let auth = auth_manager.as_ref().and_then(|m| m.auth());
+            let api_provider = self
+                .provider
+                .to_api_provider(auth.as_ref().map(|a| a.mode))?;
+            let api_auth = auth_provider_from_auth(auth.clone(), &self.provider).await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let (request_telemetry, sse_telemetry) = self.build_streaming_telemetry();
+            let client = ApiAnthropicMessagesClient::new(transport, api_provider, api_auth)
+                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+
+            let stream_result = client.stream_body(body.clone()).await;
+
+            match stream_result {
+                Ok(stream) => {
+                    return Ok(map_response_stream(stream, self.otel_event_manager.clone()));
+                }
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UNAUTHORIZED =>
                 {

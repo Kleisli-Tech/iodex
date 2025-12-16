@@ -70,7 +70,10 @@ impl<T: HttpTransport, A: AuthProvider> ChatClient<T, A> {
     fn path(&self) -> &'static str {
         match self.streaming.provider().wire {
             WireApi::Chat => "chat/completions",
-            _ => "responses",
+            WireApi::Responses | WireApi::Compact => "responses",
+            WireApi::AnthropicMessages => {
+                panic!("AnthropicMessages wire api is not supported by ChatClient")
+            }
         }
     }
 
