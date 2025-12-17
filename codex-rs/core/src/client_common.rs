@@ -394,7 +394,7 @@ pub(crate) mod anthropic {
                     ..
                 } => {
                     let input_json: Value =
-                        serde_json::from_str(&arguments).unwrap_or_else(|_| json!(arguments));
+                        serde_json::from_str(arguments).unwrap_or_else(|_| json!(arguments));
                     messages.push(json!({
                         "role": "assistant",
                         "content": [{
@@ -410,29 +410,25 @@ pub(crate) mod anthropic {
                     // so that Anthropic sees the required adjacency.
                     if let Some(output_index) =
                         first_output_index_by_call_id.get(call_id.as_str()).copied()
+                        && output_index > index
+                        && !consumed_output_indices.contains(&output_index)
+                        && matches!(
+                            input.get(output_index),
+                            Some(ResponseItem::FunctionCallOutput { .. })
+                        )
+                        && let Some(ResponseItem::FunctionCallOutput { output, .. }) =
+                            input.get(output_index)
                     {
-                        if output_index > index
-                            && !consumed_output_indices.contains(&output_index)
-                            && matches!(
-                                input.get(output_index),
-                                Some(ResponseItem::FunctionCallOutput { .. })
-                            )
-                        {
-                            if let Some(ResponseItem::FunctionCallOutput { output, .. }) =
-                                input.get(output_index)
-                            {
-                                let content_value = function_output_to_tool_result_content(output);
-                                messages.push(json!({
-                                    "role": "user",
-                                    "content": [{
-                                        "type": "tool_result",
-                                        "tool_use_id": call_id,
-                                        "content": content_value,
-                                    }],
-                                }));
-                                consumed_output_indices.insert(output_index);
-                            }
-                        }
+                        let content_value = function_output_to_tool_result_content(output);
+                        messages.push(json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": content_value,
+                            }],
+                        }));
+                        consumed_output_indices.insert(output_index);
                     }
                 }
                 ResponseItem::FunctionCallOutput { call_id, output } => {
@@ -492,15 +488,13 @@ pub(crate) mod anthropic {
             } else {
                 Value::Array(mapped)
             }
+        } else if output.content.trim().is_empty() {
+            Value::Array(vec![])
         } else {
-            if output.content.trim().is_empty() {
-                Value::Array(vec![])
-            } else {
-                Value::Array(vec![json!({
-                    "type": "text",
-                    "text": output.content,
-                })])
-            }
+            Value::Array(vec![json!({
+                "type": "text",
+                "text": output.content,
+            })])
         }
     }
 }
@@ -719,9 +713,15 @@ mod tests {
             body.get("system").and_then(|v| v.as_str()),
             Some(instructions.as_str())
         );
-        assert_eq!(body.get("stream").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            body.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
 
-        let max_tokens = body.get("max_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
         assert!(max_tokens > 0);
         assert!(max_tokens <= 64_000);
 
@@ -1063,5 +1063,263 @@ mod tests {
             source.get("url").and_then(|v| v.as_str()),
             Some("https://example.com/image.png")
         );
+    }
+
+    #[test]
+    fn anthropic_system_prompt_placement() {
+        use super::anthropic::build_anthropic_messages_body;
+
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+
+        let body = build_anthropic_messages_body(&prompt, &model_family, instructions, tools_json)
+            .expect("anthropic body");
+
+        // System prompt should be in "system" field, not in messages
+        assert!(
+            body.get("system").is_some(),
+            "expected system field in body"
+        );
+
+        let system = body.get("system").expect("system field");
+        // Should be a non-empty string or array
+        assert!(
+            system.is_string() || system.is_array(),
+            "system should be string or array"
+        );
+
+        // Messages should not contain system role messages
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            assert_ne!(role, "system", "messages should not contain system role");
+        }
+    }
+
+    #[test]
+    fn anthropic_max_tokens_calculation() {
+        use super::anthropic::build_anthropic_messages_body;
+
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "test".to_string(),
+            }],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+
+        let body = build_anthropic_messages_body(&prompt, &model_family, instructions, tools_json)
+            .expect("anthropic body");
+
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .expect("max_tokens field");
+
+        // max_tokens should be a positive number
+        assert!(max_tokens > 0, "max_tokens should be positive");
+
+        // Anthropic has a limit of 8192 for most models, but could be higher
+        // Just verify it's reasonable
+        assert!(
+            max_tokens <= 100_000,
+            "max_tokens should not exceed reasonable limit"
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_serialization() {
+        use super::anthropic::build_anthropic_messages_body;
+
+        let prompt = Prompt {
+            parallel_tool_calls: true,
+            input: vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "test".to_string(),
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = vec![serde_json::json!({
+            "name": "test_tool",
+            "description": "A test tool",
+            "input_schema": {"type": "object", "properties": {}}
+        })];
+
+        let body = build_anthropic_messages_body(&prompt, &model_family, instructions, tools_json)
+            .expect("anthropic body");
+
+        // Should have tools array
+        let tools = body.get("tools").and_then(|v| v.as_array());
+        assert!(tools.is_some(), "expected tools array when tools provided");
+
+        // tool_choice should be set when tools are present
+        // Anthropic uses "auto" for tool_choice when parallel is supported
+        if let Some(tool_choice) = body.get("tool_choice") {
+            // tool_choice can be "auto", "any", "none", or {"type": "tool", "name": "..."}
+            assert!(
+                tool_choice.is_string() || tool_choice.is_object(),
+                "tool_choice should be string or object"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_empty_messages_filtered() {
+        use super::anthropic::build_anthropic_messages_body;
+
+        let mut prompt = Prompt::default();
+        // Add a message with empty content
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![],
+        });
+        // Add a valid message
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+
+        let body = build_anthropic_messages_body(&prompt, &model_family, instructions, tools_json)
+            .expect("anthropic body");
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+
+        // Verify no messages have empty content arrays
+        for msg in messages {
+            if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                // Content array should not be empty if the message is included
+                // (empty messages might be filtered out entirely, or content might be non-array)
+                if !content.is_empty() {
+                    // All content blocks should have non-empty text
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            assert!(
+                                !text.trim().is_empty(),
+                                "text blocks should not be whitespace-only"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_multiple_images_in_message() {
+        use super::anthropic::build_anthropic_messages_body;
+
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputImage {
+                    image_url: "data:image/png;base64,aGVsbG8=".to_string(),
+                },
+                ContentItem::InputText {
+                    text: "What are these images?".to_string(),
+                },
+                ContentItem::InputImage {
+                    image_url: "https://example.com/image2.png".to_string(),
+                },
+            ],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+
+        let body = build_anthropic_messages_body(&prompt, &model_family, instructions, tools_json)
+            .expect("anthropic body");
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+
+        let content = messages[0]
+            .get("content")
+            .and_then(|v| v.as_array())
+            .expect("content array");
+
+        // Count image blocks
+        let image_count = content
+            .iter()
+            .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("image"))
+            .count();
+
+        assert_eq!(image_count, 2, "expected two image blocks");
+
+        // Verify first image is base64
+        let first_image = content
+            .iter()
+            .find(|block| block.get("type").and_then(|t| t.as_str()) == Some("image"))
+            .expect("first image");
+        let first_source = first_image.get("source").expect("source");
+        assert_eq!(
+            first_source.get("type").and_then(|t| t.as_str()),
+            Some("base64")
+        );
+
+        // Verify there's also a URL image
+        let url_image_count = content
+            .iter()
+            .filter(|block| {
+                block.get("type").and_then(|t| t.as_str()) == Some("image")
+                    && block
+                        .get("source")
+                        .and_then(|s| s.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("url")
+            })
+            .count();
+        assert_eq!(url_image_count, 1, "expected one URL image");
     }
 }

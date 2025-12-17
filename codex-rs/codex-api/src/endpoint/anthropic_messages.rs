@@ -57,3 +57,92 @@ impl<T: HttpTransport, A: AuthProvider> AnthropicMessagesClient<T, A> {
         self.stream(body, HeaderMap::new()).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::RetryConfig;
+    use async_trait::async_trait;
+    use codex_client::Request;
+    use codex_client::Response;
+    use codex_client::StreamResponse;
+    use codex_client::TransportError;
+    use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct DummyTransport;
+
+    #[async_trait]
+    impl HttpTransport for DummyTransport {
+        async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
+            Err(TransportError::Build("execute should not run".to_string()))
+        }
+
+        async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
+            Err(TransportError::Build("stream should not run".to_string()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DummyAuth;
+
+    impl AuthProvider for DummyAuth {
+        fn bearer_token(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn provider(wire: WireApi) -> Provider {
+        Provider {
+            name: "test".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            query_params: None,
+            wire,
+            headers: HeaderMap::new(),
+            retry: RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                retry_429: false,
+                retry_5xx: true,
+                retry_transport: true,
+            },
+            stream_idle_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn anthropic_client_new_with_correct_wire_api() {
+        let transport = DummyTransport;
+        let auth = DummyAuth;
+        let prov = provider(WireApi::AnthropicMessages);
+
+        let result = AnthropicMessagesClient::new(transport, prov, auth);
+        assert!(result.is_ok(), "expected Ok for AnthropicMessages wire api");
+    }
+
+    #[test]
+    fn anthropic_client_new_with_wrong_wire_api_responses() {
+        let transport = DummyTransport;
+        let auth = DummyAuth;
+        let prov = provider(WireApi::Responses);
+
+        let result = AnthropicMessagesClient::new(transport, prov, auth);
+        assert!(
+            matches!(result, Err(ApiError::Config(msg)) if msg.contains("AnthropicMessages wire api")),
+            "expected Config error for Responses wire api"
+        );
+    }
+
+    #[test]
+    fn anthropic_client_new_with_wrong_wire_api_chat() {
+        let transport = DummyTransport;
+        let auth = DummyAuth;
+        let prov = provider(WireApi::Chat);
+
+        let result = AnthropicMessagesClient::new(transport, prov, auth);
+        assert!(
+            matches!(result, Err(ApiError::Config(msg)) if msg.contains("AnthropicMessages wire api")),
+            "expected Config error for Chat wire api"
+        );
+    }
+}

@@ -563,4 +563,72 @@ mod tests {
         assert_eq!(family.context_window, Some(200_000));
         assert!(family.base_instructions.contains("You are Claude"));
     }
+
+    #[test]
+    fn claude_model_variants_resolve_correctly() {
+        // Test different Claude model variants
+        let variants = [
+            "claude-sonnet-4.5",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307",
+        ];
+
+        for variant in variants {
+            let family = find_family_for_model(variant);
+            assert_eq!(
+                family.family, "claude",
+                "variant {variant} should have family 'claude'"
+            );
+            assert_eq!(
+                family.shell_type,
+                ConfigShellToolType::ShellCommand,
+                "variant {variant} should use ShellCommand"
+            );
+            assert!(
+                family.supports_parallel_tool_calls,
+                "variant {variant} should support parallel tool calls"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_prompt_contains_key_sections() {
+        let family = find_family_for_model("claude-sonnet-4.5");
+
+        // Verify the prompt contains expected key sections
+        assert!(
+            family.base_instructions.contains("You are Claude"),
+            "prompt should identify as Claude"
+        );
+        // Check that it has some form of instructions/guidance
+        assert!(
+            !family.base_instructions.is_empty(),
+            "prompt should not be empty"
+        );
+        // Claude prompts should be substantial
+        assert!(
+            family.base_instructions.len() > 100,
+            "prompt should be substantial"
+        );
+    }
+
+    #[test]
+    fn claude_tool_types_configured() {
+        let family = find_family_for_model("claude-sonnet-4.5");
+
+        // Claude should use Function type for apply_patch
+        assert_eq!(
+            family.apply_patch_tool_type,
+            Some(ApplyPatchToolType::Function),
+            "Claude should use Function apply_patch tool type"
+        );
+
+        // Shell type should be ShellCommand for Claude
+        assert_eq!(
+            family.shell_type,
+            ConfigShellToolType::ShellCommand,
+            "Claude should use ShellCommand"
+        );
+    }
 }

@@ -210,115 +210,113 @@ pub async fn process_anthropic_sse(
                 }
             }
             "message_delta" => {
-                if let Some(msg) = event.message {
-                    if let Some(usage) = msg.usage {
-                        token_usage = Some(usage.into());
-                    }
+                if let Some(msg) = event.message
+                    && let Some(usage) = msg.usage
+                {
+                    token_usage = Some(usage.into());
                 }
                 if let Some(usage) = event.usage {
                     token_usage = Some(usage.into());
                 }
             }
             "content_block_start" => {
-                if let (Some(index), Some(block)) = (event.index, event.content_block) {
-                    if block.kind == "tool_use" {
-                        let state = tool_use_blocks.entry(index).or_default();
-                        state.id = block.id;
-                        state.name = block.name;
-                        state.input = block.input;
-                    }
+                if let (Some(index), Some(block)) = (event.index, event.content_block)
+                    && block.kind == "tool_use"
+                {
+                    let state = tool_use_blocks.entry(index).or_default();
+                    state.id = block.id;
+                    state.name = block.name;
+                    state.input = block.input;
                 }
             }
             "content_block_delta" => {
                 if let Some(delta) = event.delta {
-                    if let Some(text) = delta.text {
-                        if !text.is_empty() {
-                            if !assistant_started {
-                                assistant_started = true;
-                                let item = ResponseItem::Message {
-                                    id: None,
-                                    role: "assistant".to_string(),
-                                    content: Vec::new(),
-                                };
-                                if tx_event
-                                    .send(Ok(ResponseEvent::OutputItemAdded(item)))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            assistant_text.push_str(&text);
+                    if let Some(text) = delta.text
+                        && !text.is_empty()
+                    {
+                        if !assistant_started {
+                            assistant_started = true;
+                            let item = ResponseItem::Message {
+                                id: None,
+                                role: "assistant".to_string(),
+                                content: Vec::new(),
+                            };
                             if tx_event
-                                .send(Ok(ResponseEvent::OutputTextDelta(text)))
+                                .send(Ok(ResponseEvent::OutputItemAdded(item)))
                                 .await
                                 .is_err()
                             {
                                 return;
                             }
                         }
+                        assistant_text.push_str(&text);
+                        if tx_event
+                            .send(Ok(ResponseEvent::OutputTextDelta(text)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
 
-                    if let (Some(index), Some(kind)) = (event.index, delta.kind.as_deref()) {
-                        if kind == "input_json_delta" {
-                            if let Some(part) = delta.partial_json {
-                                let state = tool_use_blocks.entry(index).or_default();
-                                state.partial_json.push_str(&part);
-                            }
-                        }
+                    if let (Some(index), Some(kind)) = (event.index, delta.kind.as_deref())
+                        && kind == "input_json_delta"
+                        && let Some(part) = delta.partial_json
+                    {
+                        let state = tool_use_blocks.entry(index).or_default();
+                        state.partial_json.push_str(&part);
                     }
                 }
             }
             "content_block_stop" => {
-                if let Some(index) = event.index {
-                    if let Some(state) = tool_use_blocks.remove(&index) {
-                        if state.name.is_some() || state.id.is_some() {
-                            let mut input_value = state.input.unwrap_or(Value::Null);
-                            if !state.partial_json.is_empty() {
-                                match serde_json::from_str::<Value>(&state.partial_json) {
-                                    Ok(val) => {
-                                        input_value = val;
-                                    }
-                                    Err(err) => {
-                                        let _ = tx_event
-                                            .send(Err(ApiError::Stream(format!(
-                                                "failed to parse tool_use input_json_delta: {err}"
-                                            ))))
-                                            .await;
-                                        return;
-                                    }
-                                }
+                if let Some(index) = event.index
+                    && let Some(state) = tool_use_blocks.remove(&index)
+                    && (state.name.is_some() || state.id.is_some())
+                {
+                    let mut input_value = state.input.unwrap_or(Value::Null);
+                    if !state.partial_json.is_empty() {
+                        match serde_json::from_str::<Value>(&state.partial_json) {
+                            Ok(val) => {
+                                input_value = val;
                             }
-
-                            let arguments = match serde_json::to_string(&input_value) {
-                                Ok(s) => s,
-                                Err(err) => {
-                                    let _ = tx_event
-                                        .send(Err(ApiError::Stream(format!(
-                                            "failed to serialize tool_use arguments: {err}"
-                                        ))))
-                                        .await;
-                                    return;
-                                }
-                            };
-
-                            let name = state.name.unwrap_or_default();
-                            let call_id = state.id.unwrap_or_else(|| format!("tool-call-{index}"));
-
-                            let item = ResponseItem::FunctionCall {
-                                id: None,
-                                name,
-                                arguments,
-                                call_id,
-                            };
-                            if tx_event
-                                .send(Ok(ResponseEvent::OutputItemDone(item)))
-                                .await
-                                .is_err()
-                            {
+                            Err(err) => {
+                                let _ = tx_event
+                                    .send(Err(ApiError::Stream(format!(
+                                        "failed to parse tool_use input_json_delta: {err}"
+                                    ))))
+                                    .await;
                                 return;
                             }
                         }
+                    }
+
+                    let arguments = match serde_json::to_string(&input_value) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            let _ = tx_event
+                                .send(Err(ApiError::Stream(format!(
+                                    "failed to serialize tool_use arguments: {err}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let name = state.name.unwrap_or_default();
+                    let call_id = state.id.unwrap_or_else(|| format!("tool-call-{index}"));
+
+                    let item = ResponseItem::FunctionCall {
+                        id: None,
+                        name,
+                        arguments,
+                        call_id,
+                    };
+                    if tx_event
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
                 }
             }
@@ -600,6 +598,219 @@ mod tests {
                 Some(Err(ApiError::Stream(msg))) if msg.contains("Anthropic error")
             ),
             "expected Anthropic stream error, got {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_tool_uses_in_single_message() {
+        let call_id_1 = "call-1";
+        let call_id_2 = "call-2";
+        let args_1 = json!({"command": "ls -la"});
+        let args_2 = json!({"command": "pwd"});
+
+        let body = anthropic_sse(vec![
+            json!({"type":"message_start","message":{"id":"msg-1"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use",
+                "id": call_id_1,
+                "name": "shell",
+                "input": args_1,
+            }}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{
+                "type":"tool_use",
+                "id": call_id_2,
+                "name": "shell",
+                "input": args_2,
+            }}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_stop","message":{"id":"msg-1"}}),
+        ]);
+
+        let events = collect_events(body).await;
+
+        let mut saw_call_1 = false;
+        let mut saw_call_2 = false;
+
+        for ev in &events {
+            if let Ok(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                call_id,
+                arguments,
+                ..
+            })) = ev
+            {
+                if call_id == call_id_1 {
+                    assert_eq!(name, "shell");
+                    let parsed: Value = serde_json::from_str(arguments).expect("arguments json");
+                    assert_eq!(parsed, json!({"command": "ls -la"}));
+                    saw_call_1 = true;
+                } else if call_id == call_id_2 {
+                    assert_eq!(name, "shell");
+                    let parsed: Value = serde_json::from_str(arguments).expect("arguments json");
+                    assert_eq!(parsed, json!({"command": "pwd"}));
+                    saw_call_2 = true;
+                }
+            }
+        }
+
+        assert!(saw_call_1, "expected first tool call");
+        assert!(saw_call_2, "expected second tool call");
+    }
+
+    #[tokio::test]
+    async fn mixed_text_and_tool_use() {
+        let call_id = "call-1";
+        let args = json!({"command": "ls"});
+
+        let body = anthropic_sse(vec![
+            json!({"type":"message_start","message":{"id":"msg-1"}}),
+            // Text block first
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"text",
+                "text":""
+            }}),
+            json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"text_delta",
+                "text":"Let me list the files."
+            }}),
+            json!({"type":"content_block_stop","index":0}),
+            // Tool use block second
+            json!({"type":"content_block_start","index":1,"content_block":{
+                "type":"tool_use",
+                "id": call_id,
+                "name": "shell",
+                "input": args,
+            }}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_stop","message":{"id":"msg-1"}}),
+        ]);
+
+        let events = collect_events(body).await;
+
+        let mut saw_text = false;
+        let mut saw_tool_call = false;
+
+        for ev in &events {
+            match ev {
+                Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. })) => {
+                    for item in content {
+                        if let ContentItem::OutputText { text } = item
+                            && text.contains("list the files")
+                        {
+                            saw_text = true;
+                        }
+                    }
+                }
+                Ok(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                    name,
+                    call_id: cid,
+                    ..
+                })) => {
+                    if cid == call_id && name == "shell" {
+                        saw_tool_call = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_text, "expected text content");
+        assert!(saw_tool_call, "expected tool call");
+    }
+
+    #[tokio::test]
+    async fn usage_from_message_delta() {
+        // Tests that usage from message_delta event is captured correctly.
+        // Anthropic API typically sends the final usage in message_delta.
+        let body = anthropic_sse(vec![
+            json!({"type":"message_start","message":{"id":"msg-1"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":100,"output_tokens":50}}),
+            json!({"type":"message_stop","message":{"id":"msg-1"}}),
+        ]);
+
+        let events = collect_events(body).await;
+
+        let mut found_usage = false;
+        for ev in &events {
+            if let Ok(ResponseEvent::Completed { token_usage, .. }) = ev {
+                let usage = token_usage.as_ref().expect("token usage");
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 50);
+                // total_tokens is computed when not explicitly provided
+                assert_eq!(
+                    usage.total_tokens, 150,
+                    "total should be computed from input + output"
+                );
+                found_usage = true;
+            }
+        }
+
+        assert!(found_usage, "expected completed event with usage");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_event_skipped() {
+        // Create an SSE stream with a malformed JSON event in the middle
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\"}}\n\n",
+            "data: {not valid json}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\",\"message\":{\"id\":\"msg-1\"}}\n\n",
+        );
+
+        let events = collect_events(raw.to_string()).await;
+
+        // Should still get the valid events
+        let mut saw_completed = false;
+        let mut saw_item_done = false;
+
+        for ev in &events {
+            match ev {
+                Ok(ResponseEvent::Completed { .. }) => saw_completed = true,
+                Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. })) => {
+                    for item in content {
+                        if let ContentItem::OutputText { text } = item
+                            && text == "Hello"
+                        {
+                            saw_item_done = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_completed, "expected completed event");
+        assert!(saw_item_done, "expected item done with Hello text");
+    }
+
+    #[tokio::test]
+    async fn content_block_without_stop_handled() {
+        // Stream ends without content_block_stop for a text block
+        let body = anthropic_sse(vec![
+            json!({"type":"message_start","message":{"id":"msg-1"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}),
+            // No content_block_stop, directly to message_stop
+            json!({"type":"message_stop","message":{"id":"msg-1"}}),
+        ]);
+
+        let events = collect_events(body).await;
+
+        // Should still produce a completed event
+        let saw_completed = events
+            .iter()
+            .any(|ev| matches!(ev, Ok(ResponseEvent::Completed { .. })));
+
+        assert!(
+            saw_completed,
+            "expected completed event even without content_block_stop"
         );
     }
 }

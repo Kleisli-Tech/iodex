@@ -203,4 +203,88 @@ mod tests {
         let headers = HeaderMap::new();
         assert!(parse_anthropic_rate_limit(&headers).is_none());
     }
+
+    #[test]
+    fn parse_anthropic_rate_limit_partial_headers_requests_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            HeaderValue::from_static("50"),
+        );
+        // No token headers
+
+        let snapshot =
+            parse_anthropic_rate_limit(&headers).expect("should parse with requests only");
+
+        // Primary (requests): 50% used
+        let primary = snapshot.primary.expect("primary window");
+        assert!((primary.used_percent - 50.0).abs() < 0.01);
+
+        // Secondary (tokens) should be None
+        assert!(snapshot.secondary.is_none());
+    }
+
+    #[test]
+    fn parse_anthropic_rate_limit_partial_headers_tokens_only() {
+        let mut headers = HeaderMap::new();
+        // No request headers
+        headers.insert(
+            "anthropic-ratelimit-tokens-limit",
+            HeaderValue::from_static("50000"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-tokens-remaining",
+            HeaderValue::from_static("25000"),
+        );
+
+        let snapshot = parse_anthropic_rate_limit(&headers).expect("should parse with tokens only");
+
+        // Primary (requests) should be None
+        assert!(snapshot.primary.is_none());
+
+        // Secondary (tokens): 50% used
+        let secondary = snapshot.secondary.expect("secondary window");
+        assert!((secondary.used_percent - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_anthropic_rate_limit_invalid_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            HeaderValue::from_static("not-a-number"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            HeaderValue::from_static("50"),
+        );
+
+        // Should return None when limit header is invalid
+        let result = parse_anthropic_rate_limit(&headers);
+        assert!(result.is_none(), "expected None for invalid header values");
+    }
+
+    #[test]
+    fn parse_anthropic_rate_limit_zero_limit() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            HeaderValue::from_static("0"),
+        );
+
+        let snapshot = parse_anthropic_rate_limit(&headers).expect("should parse with zero limit");
+
+        // With zero limit, used_percent should be 0.0 (not NaN or infinity)
+        let primary = snapshot.primary.expect("primary window");
+        assert!(primary.used_percent.is_finite());
+        assert!((primary.used_percent - 0.0).abs() < 0.01);
+    }
 }
