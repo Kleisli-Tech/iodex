@@ -16,6 +16,7 @@ const GPT_5_CODEX_INSTRUCTIONS: &str = include_str!("../../gpt_5_codex_prompt.md
 const GPT_5_1_INSTRUCTIONS: &str = include_str!("../../gpt_5_1_prompt.md");
 const GPT_5_2_INSTRUCTIONS: &str = include_str!("../../gpt_5_2_prompt.md");
 const GPT_5_1_CODEX_MAX_INSTRUCTIONS: &str = include_str!("../../gpt-5.1-codex-max_prompt.md");
+const CLAUDE_4_5_INSTRUCTIONS: &str = include_str!("../../claude_4_5_prompt.md");
 pub(crate) const CONTEXT_WINDOW_272K: i64 = 272_000;
 
 /// A model family is a group of models that share certain characteristics.
@@ -368,6 +369,7 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
             supports_parallel_tool_calls: true,
             apply_patch_tool_type: Some(ApplyPatchToolType::Function),
             context_window: Some(200_000),
+            base_instructions: CLAUDE_4_5_INSTRUCTIONS.to_string(),
         )
     } else {
         derive_default_model_family(slug)
@@ -559,5 +561,6 @@ mod tests {
         );
         assert!(family.supports_parallel_tool_calls);
         assert_eq!(family.context_window, Some(200_000));
+        assert!(family.base_instructions.contains("You are Claude"));
     }
 }

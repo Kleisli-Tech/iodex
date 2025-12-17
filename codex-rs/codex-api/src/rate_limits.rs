@@ -104,3 +104,103 @@ fn parse_header_bool(headers: &HeaderMap, name: &str) -> Option<bool> {
 fn parse_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
+
+/// Parses Anthropic rate-limit headers into a `RateLimitSnapshot`.
+///
+/// Anthropic headers:
+/// - `anthropic-ratelimit-requests-limit` / `anthropic-ratelimit-requests-remaining`
+/// - `anthropic-ratelimit-tokens-limit` / `anthropic-ratelimit-tokens-remaining`
+///
+/// Note: Reset timestamps are not parsed to avoid adding datetime dependencies.
+pub fn parse_anthropic_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
+    // Requests rate limit (primary)
+    let primary = parse_anthropic_rate_limit_window(
+        headers,
+        "anthropic-ratelimit-requests-limit",
+        "anthropic-ratelimit-requests-remaining",
+    );
+
+    // Tokens rate limit (secondary)
+    let secondary = parse_anthropic_rate_limit_window(
+        headers,
+        "anthropic-ratelimit-tokens-limit",
+        "anthropic-ratelimit-tokens-remaining",
+    );
+
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+
+    Some(RateLimitSnapshot {
+        primary,
+        secondary,
+        credits: None,
+        plan_type: None,
+    })
+}
+
+fn parse_anthropic_rate_limit_window(
+    headers: &HeaderMap,
+    limit_header: &str,
+    remaining_header: &str,
+) -> Option<RateLimitWindow> {
+    let limit = parse_header_i64(headers, limit_header)?;
+    let remaining = parse_header_i64(headers, remaining_header)?;
+
+    // Calculate used percent: (limit - remaining) / limit * 100
+    let used_percent = if limit > 0 {
+        ((limit - remaining) as f64 / limit as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Some(RateLimitWindow {
+        used_percent,
+        window_minutes: None, // Anthropic doesn't provide window duration
+        resets_at: None,      // Skip parsing ISO 8601 to avoid datetime deps
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderMap;
+    use http::HeaderValue;
+
+    #[test]
+    fn parse_anthropic_rate_limit_with_requests_and_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            HeaderValue::from_static("75"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-tokens-limit",
+            HeaderValue::from_static("10000"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-tokens-remaining",
+            HeaderValue::from_static("8000"),
+        );
+
+        let snapshot = parse_anthropic_rate_limit(&headers).expect("should parse");
+
+        // Primary (requests): 25% used (100 - 75) / 100
+        let primary = snapshot.primary.expect("primary window");
+        assert!((primary.used_percent - 25.0).abs() < 0.01);
+
+        // Secondary (tokens): 20% used (10000 - 8000) / 10000
+        let secondary = snapshot.secondary.expect("secondary window");
+        assert!((secondary.used_percent - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_anthropic_rate_limit_missing_headers_returns_none() {
+        let headers = HeaderMap::new();
+        assert!(parse_anthropic_rate_limit(&headers).is_none());
+    }
+}

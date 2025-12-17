@@ -315,6 +315,15 @@ pub(crate) mod anthropic {
         capped.max(1)
     }
 
+    /// Parse a data URL into (media_type, base64_data).
+    /// Expected format: data:image/png;base64,<data>
+    fn parse_data_url(url: &str) -> Option<(String, String)> {
+        let url = url.strip_prefix("data:")?;
+        let (meta, data) = url.split_once(',')?;
+        let media_type = meta.strip_suffix(";base64")?.to_string();
+        Some((media_type, data.to_string()))
+    }
+
     fn response_items_to_anthropic_messages(prompt: &Prompt) -> Vec<Value> {
         let input = prompt.get_formatted_input();
         let mut messages: Vec<Value> = Vec::new();
@@ -345,10 +354,29 @@ pub(crate) mod anthropic {
                                 }
                             }
                             ContentItem::InputImage { image_url } => {
-                                blocks.push(json!({
-                                    "type": "image_url",
-                                    "image_url": { "url": image_url },
-                                }));
+                                // Anthropic accepts both URL and base64 formats
+                                if image_url.starts_with("data:") {
+                                    // Parse data URL: data:image/png;base64,<data>
+                                    if let Some((media_type, data)) = parse_data_url(image_url) {
+                                        blocks.push(json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": media_type,
+                                                "data": data,
+                                            }
+                                        }));
+                                    }
+                                } else {
+                                    // External URL
+                                    blocks.push(json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "url",
+                                            "url": image_url,
+                                        }
+                                    }));
+                                }
                             }
                         }
                     }
@@ -483,6 +511,7 @@ mod tests {
     use codex_api::common::OpenAiVerbosity;
     use codex_api::common::TextControls;
     use codex_api::create_text_param_for_request;
+    use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
 
@@ -941,6 +970,98 @@ mod tests {
         assert!(
             texts.iter().all(|t| !t.trim().is_empty()),
             "expected no whitespace-only text blocks in tool_result content"
+        );
+    }
+
+    #[test]
+    fn anthropic_image_base64_format() {
+        use super::anthropic::build_anthropic_messages_body;
+
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+            }],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+
+        let body = build_anthropic_messages_body(&prompt, &model_family, instructions, tools_json)
+            .expect("anthropic body");
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        let content = messages[0]
+            .get("content")
+            .and_then(|v| v.as_array())
+            .expect("content array");
+        let image_block = &content[0];
+
+        assert_eq!(
+            image_block.get("type").and_then(|v| v.as_str()),
+            Some("image")
+        );
+        let source = image_block.get("source").expect("source object");
+        assert_eq!(source.get("type").and_then(|v| v.as_str()), Some("base64"));
+        assert_eq!(
+            source.get("media_type").and_then(|v| v.as_str()),
+            Some("image/png")
+        );
+        assert_eq!(
+            source.get("data").and_then(|v| v.as_str()),
+            Some("iVBORw0KGgo=")
+        );
+    }
+
+    #[test]
+    fn anthropic_image_url_format() {
+        use super::anthropic::build_anthropic_messages_body;
+
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "https://example.com/image.png".to_string(),
+            }],
+        });
+
+        let config = test_config();
+        let model_family =
+            ModelsManager::construct_model_family_offline("claude-sonnet-4.5", &config);
+        let instructions = prompt.get_full_instructions(&model_family).into_owned();
+        let tools_json: Vec<serde_json::Value> = Vec::new();
+
+        let body = build_anthropic_messages_body(&prompt, &model_family, instructions, tools_json)
+            .expect("anthropic body");
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        let content = messages[0]
+            .get("content")
+            .and_then(|v| v.as_array())
+            .expect("content array");
+        let image_block = &content[0];
+
+        assert_eq!(
+            image_block.get("type").and_then(|v| v.as_str()),
+            Some("image")
+        );
+        let source = image_block.get("source").expect("source object");
+        assert_eq!(source.get("type").and_then(|v| v.as_str()), Some("url"));
+        assert_eq!(
+            source.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/image.png")
         );
     }
 }

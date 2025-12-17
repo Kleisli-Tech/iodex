@@ -1,10 +1,10 @@
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
+use crate::rate_limits::parse_anthropic_rate_limit;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
-// use codex_client::TransportError;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
@@ -26,8 +26,12 @@ pub(crate) fn spawn_anthropic_stream(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
 ) -> ResponseStream {
+    let rate_limits = parse_anthropic_rate_limit(&stream_response.headers);
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
+        if let Some(snapshot) = rate_limits {
+            let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
+        }
         process_anthropic_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
     });
     ResponseStream { rx_event }
@@ -394,7 +398,7 @@ mod tests {
     use crate::common::ResponseEvent;
     use crate::error::ApiError;
     use bytes::Bytes;
-    use futures::StreamExt;
+    use codex_client::TransportError;
     use futures::TryStreamExt;
     use serde_json::json;
     use tokio::sync::mpsc;

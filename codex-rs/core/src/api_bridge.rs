@@ -85,6 +85,7 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
             }
         },
         ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
+        ApiError::Config(msg) => CodexErr::InvalidRequest(msg),
     }
 }
 

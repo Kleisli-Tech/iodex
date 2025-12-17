@@ -25,6 +25,8 @@ pub enum ApiError {
     },
     #[error("rate limit: {0}")]
     RateLimit(String),
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
 impl From<RateLimitError> for ApiError {

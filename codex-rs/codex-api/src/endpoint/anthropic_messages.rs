@@ -17,13 +17,16 @@ pub struct AnthropicMessagesClient<T: HttpTransport, A: AuthProvider> {
 }
 
 impl<T: HttpTransport, A: AuthProvider> AnthropicMessagesClient<T, A> {
-    pub fn new(transport: T, provider: Provider, auth: A) -> Self {
+    pub fn new(transport: T, provider: Provider, auth: A) -> Result<Self, ApiError> {
         if provider.wire != WireApi::AnthropicMessages {
-            panic!("AnthropicMessagesClient requires a provider with AnthropicMessages wire api");
+            return Err(ApiError::Config(
+                "AnthropicMessagesClient requires a provider with AnthropicMessages wire api"
+                    .to_string(),
+            ));
         }
-        Self {
+        Ok(Self {
             streaming: StreamingClient::new(transport, provider, auth),
-        }
+        })
     }
 
     pub fn with_telemetry(

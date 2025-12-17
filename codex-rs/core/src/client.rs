@@ -233,6 +233,7 @@ impl ModelClient {
             let transport = ReqwestTransport::new(build_reqwest_client());
             let (request_telemetry, sse_telemetry) = self.build_streaming_telemetry();
             let client = ApiAnthropicMessagesClient::new(transport, api_provider, api_auth)
+                .map_err(map_api_error)?
                 .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
 
             let stream_result = client.stream_body(body.clone()).await;
